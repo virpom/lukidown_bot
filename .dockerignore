@@ -1,0 +1,13 @@
+.git
+.gitignore
+.dockerignore
+.env
+.env.example
+cookies.txt
+tests/
+.idea/
+__pycache__/
+*.pyc
+downloads/
+sessions/
+get_vk_token.py

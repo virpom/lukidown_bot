@@ -78,9 +78,11 @@ async def download_yandex(
         raise RuntimeError("Could not parse Yandex URL")
     entity_type = match.group(1)
     entity_id = match.group(2)
+    duration_ms = None
     if entity_type == "track":
         data = await _parse_yandex_api("tracks", entity_id)
         if isinstance(data, list): data = data[0]
+        duration_ms = data.get("durationMs")
         track_name = data.get("title", "Unknown")
         artists = data.get("artists", [])
         artist_name = artists[0]["name"] if artists else "Unknown"
@@ -92,6 +94,7 @@ async def download_yandex(
         if track_id_match:
             data = await _parse_yandex_api("tracks", track_id_match.group(1))
             if isinstance(data, list): data = data[0]
+            duration_ms = data.get("durationMs")
             track_name = data.get("title", "Unknown")
             artists = data.get("artists", [])
             artist_name = artists[0]["name"] if artists else "Unknown"
@@ -106,6 +109,7 @@ async def download_yandex(
             if tracks:
                 track_data = await _parse_yandex_api("tracks", tracks[0]["id"])
                 if isinstance(track_data, list): track_data = track_data[0]
+                duration_ms = track_data.get("durationMs")
                 track_name = track_data.get("title", "Unknown")
                 artists = track_data.get("artists", [])
                 artist_name = artists[0]["name"] if artists else "Unknown"
@@ -123,6 +127,7 @@ async def download_yandex(
         thumb_url=f"https://{cover_uri}" if cover_uri else None,
         should_cancel=should_cancel,
         lang=lang,
+        expected_duration=(duration_ms // 1000) if duration_ms else None,
     )
 
 

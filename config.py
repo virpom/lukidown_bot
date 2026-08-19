@@ -30,6 +30,7 @@ class Config:
     CANCEL_TTL_SECONDS: int = field(default_factory=lambda: int(os.getenv("CANCEL_TTL_SECONDS", "60")))
     HISTORY_LIMIT: int = field(default_factory=lambda: int(os.getenv("HISTORY_LIMIT", "10")))
     REDDIT_COOKIE: str = field(default_factory=lambda: os.getenv('REDDIT_COOKIE', ''))
+    VK_ACCESS_TOKEN: str = field(default_factory=lambda: os.getenv('VK_ACCESS_TOKEN', ''))
 
     def validate(self):
         """Validate that all required configuration variables are present.

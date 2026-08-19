@@ -114,6 +114,12 @@ STRINGS: dict[str, dict[str, str]] = {
         "dl_apple_search": "Ищу трек в Apple Music...",
         "dl_format_converted": "Запрошенный формат недоступен, конвертирую из лучшего доступного...",
         "dl_yt_search_fallback": "Поиск на YouTube не дал результатов, пробую SoundCloud...",
+        "vk_getting_user_audio": "Получаю список аудиозаписей пользователя...",
+        "vk_profile_closed": "Не удалось получить музыку: профиль закрыт, это не пользователь, или нет публичных аудио.",
+        "vk_download_progress": "Скачиваю {idx}/{total}: {artist} - {title}",
+        "vk_download_done": "Готово: скачано {sent}, пропущено {skipped}.",
+        "vk_auth_needed": "Чтобы скачать всю музыку этого профиля, нужно авторизоваться в VK.\nПерейди по ссылке, нажми «Разрешить» и пришли сюда получившуюся ссылку из адресной строки:",
+        "vk_auth_no_pending": "Сначала скинь ссылку на профиль VK (vk.com/…), чью музыку хочешь скачать, а потом уже ссылку авторизации.",
     },
     "en": {
         "select_language_prompt": "**Please select your language / Пожалуйста, выберите язык:**",
@@ -221,6 +227,12 @@ STRINGS: dict[str, dict[str, str]] = {
         "dl_apple_search": "Searching track in Apple Music...",
         "dl_format_converted": "Required format not available, converting from best available...",
         "dl_yt_search_fallback": "YouTube search gave no results, searching on SoundCloud...",
+        "vk_getting_user_audio": "Fetching the user's audio list...",
+        "vk_profile_closed": "Could not fetch music: profile is private, not a user, or has no public audio.",
+        "vk_download_progress": "Downloading {idx}/{total}: {artist} - {title}",
+        "vk_download_done": "Done: {sent} downloaded, {skipped} skipped.",
+        "vk_auth_needed": "To download all music from this profile, authorize in VK.\nOpen the link, tap «Allow», then send me the resulting link from the address bar:",
+        "vk_auth_no_pending": "First send me a VK profile link (vk.com/…) whose music you want to download, then send the authorization link.",
     },
 }
 

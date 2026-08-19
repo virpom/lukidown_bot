@@ -58,14 +58,14 @@ PLATFORM_PATTERNS: list[tuple[Platform, list[str]]] = [
         r"(?:https?://)?(?:www\.)?rutube\.ru/play/",
     ]),
     (Platform.VK_MUSIC, [
-        r"(?:https?://)?(?:www\.)?vk\.ru/audio-?\d+_\d+",
-        r"(?:https?://)?(?:www\.)?vk\.ru/music/album/",
-        r"(?:https?://)?(?:www\.)?vk\.ru/music/playlist/",
+        r"(?:https?://)?(?:www\.|m\.)?vk\.(?:com|ru)/audio-?\d+_\d+",
+        r"(?:https?://)?(?:www\.|m\.)?vk\.(?:com|ru)/music/album/",
+        r"(?:https?://)?(?:www\.|m\.)?vk\.(?:com|ru)/music/playlist/",
     ]),
     (Platform.VK, [
-        r"(?:https?://)?(?:www\.)?vk\.ru/video",
-        r"(?:https?://)?(?:www\.)?vk\.ru/clip",
-        r"(?:https?://)?(?:www\.)?vk\.ru/wall.*video",
+        r"(?:https?://)?(?:www\.|m\.)?vk\.(?:com|ru)/video",
+        r"(?:https?://)?(?:www\.|m\.)?vk\.(?:com|ru)/clip",
+        r"(?:https?://)?(?:www\.|m\.)?vk\.(?:com|ru)/wall.*video",
         r"(?:https?://)?vkvideo\.ru/",
     ]),
     (Platform.SPOTIFY, [
@@ -112,7 +112,7 @@ PLATFORM_PATTERNS: list[tuple[Platform, list[str]]] = [
 
 URL_REGEX = re.compile(
     r"https?://[^\s<>\"{}|\\^`\[\]]+"
-    r"|(?:www\.|youtu\.be|vk\.ru|tiktok\.com|pin\.it)[^\s<>\"{}|\\^`\[\]]+"
+    r"|(?:www\.|youtu\.be|vk\.(?:com|ru)|tiktok\.com|pin\.it)[^\s<>\"{}|\\^`\[\]]+"
 )
 
 
@@ -148,3 +148,41 @@ def detect_platform(url: str) -> Platform:
             if re.search(pattern, url, re.IGNORECASE):
                 return platform
     return Platform.UNKNOWN
+
+
+_VK_PROFILE_RE = re.compile(r"(?:https?://)?(?:www\.|m\.)?vk\.(?:com|ru)/(?P<name>[^/?#\s]+)")
+_VK_RESERVED_SEGMENTS = {
+    "music", "audio", "video", "clip", "wall", "photo", "album", "market",
+    "feed", "news", "friends", "groups", "docs", "apps", "games", "stories",
+    "search", "settings", "support", "about", "legal", "terms", "help", "mail",
+    "notifications", "fave", "likes", "im", "public", "club", "event", "app",
+}
+_VK_CONTENT_PREFIX = re.compile(r"^(audio|video|clip|wall|photo|album)-?\d", re.IGNORECASE)
+
+
+def is_vk_profile(url: str) -> bool:
+    """Detect a VK user-profile URL (vk.com/<screen_name> or vk.com/id<number>).
+
+    Excludes known content/music segments so only bare profile links match.
+    """
+    m = _VK_PROFILE_RE.match(url)
+    if not m:
+        return False
+    name = m.group("name")
+    if name.lower() in _VK_RESERVED_SEGMENTS:
+        return False
+    if _VK_CONTENT_PREFIX.match(name):
+        return False
+    return True
+
+
+def vk_profile_name(url: str) -> str | None:
+    """Return the screen name / id part of a VK profile URL, or None."""
+    m = _VK_PROFILE_RE.match(url)
+    return m.group("name") if m else None
+
+
+def extract_vk_token(url: str) -> str | None:
+    """Extract a VK access_token from an OAuth redirect URL (blank.html#access_token=...)."""
+    m = re.search(r"access_token=([^&\s]+)", url)
+    return m.group(1) if m else None

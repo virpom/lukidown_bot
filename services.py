@@ -133,6 +133,7 @@ class QueueTask:
     season: int | None = None
     episode: int | None = None
     translation_id: int | None = None
+    vk_token: str | None = None
 
     def to_payload(self) -> dict[str, Any]:
         """Convert task object attributes to a JSON-serializable dictionary."""
@@ -155,6 +156,7 @@ class QueueTask:
             "season": self.season,
             "episode": self.episode,
             "translation_id": self.translation_id,
+            "vk_token": self.vk_token,
         }
 
     @classmethod

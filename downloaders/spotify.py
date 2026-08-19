@@ -235,6 +235,7 @@ async def _spotify_get_collection_tracks(
                 "artist": artists,
                 "title": t.get("name", ""),
                 "thumb": cover,
+                "duration": (t.get("duration") or {}).get("totalMilliseconds"),
             })
         return name, cover, tracks
     else:
@@ -278,6 +279,7 @@ async def _spotify_get_collection_tracks(
                 "artist": artists,
                 "title": t.get("name", ""),
                 "thumb": thumb,
+                "duration": (t.get("duration") or {}).get("totalMilliseconds"),
             })
         return name, cover, tracks
 
@@ -335,6 +337,7 @@ async def download_spotify(
     if entity_type == "track":
         if on_progress:
             await on_progress("Getting Spotify track info...")
+        duration_ms = None
         try:
             data = await _spotify_partner("getTrack", {
                 "uri": f"spotify:track:{entity_id}",
@@ -342,6 +345,7 @@ async def download_spotify(
             t = data.get("data", {}).get("trackUnion", {})
             if t.get("__typename") == "NotFound":
                 raise RuntimeError("Трек не найден в Spotify (возможно, битая ссылка или трек заблокирован)")
+            duration_ms = (t.get("duration") or {}).get("totalMilliseconds")
             track_name = t.get("name", "")
             artists_list = []
             for src in ("firstArtist", "otherArtists"):
@@ -367,6 +371,7 @@ async def download_spotify(
             thumb_url=thumb_url,
             should_cancel=should_cancel,
             lang=lang,
+            expected_duration=(duration_ms // 1000) if duration_ms else None,
         )
     if on_progress:
         await on_progress("Getting Spotify track list...")
@@ -380,6 +385,7 @@ async def download_spotify(
         artist = track["artist"] or "Unknown"
         title = track["title"] or f"Track {idx}"
         thumb = track.get("thumb") or None
+        duration_ms = track.get("duration")
         if on_progress:
             await on_progress(f"Downloading {idx}/{total}: {artist} - {title}")
         return await _download_track_search(
@@ -388,6 +394,7 @@ async def download_spotify(
             thumb_url=thumb,
             should_cancel=should_cancel,
             lang=lang,
+            expected_duration=(duration_ms // 1000) if duration_ms else None,
         )
 
     return await _process_collection_tracks(

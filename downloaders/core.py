@@ -65,6 +65,10 @@ class FileTooLarge(RuntimeError):
     """Raised when the requested media exceeds the maximum configured size limit."""
 
 
+class TrackNotFound(RuntimeError):
+    """Raised when no search result matches the expected track duration."""
+
+
 
 def _safe_filename(name: str) -> str:
     """Sanitize filename by replacing invalid characters with underscores."""
@@ -681,6 +685,12 @@ async def download_ytdlp(
     )
 
 
+def _duration_matches(actual: int, expected: int) -> bool:
+    """Check whether a downloaded track duration is close enough to the expected one."""
+    tolerance = max(10, int(expected * 0.15))
+    return abs(actual - expected) <= tolerance
+
+
 async def _download_track_search(
         artist: str, title: str, tmpdir: Path,
         on_progress: ProgressCallback | None = None,
@@ -688,43 +698,50 @@ async def _download_track_search(
         thumb_url: str | None = None,
         should_cancel: CancelCheck | None = None,
         lang: str = "ru",
+        expected_duration: int | None = None,
 ) -> DownloadResult:
-    """Download audio track by querying search engines (YouTube primary, SoundCloud fallback)."""
-    from i18n import get_text
+    """Download audio track by searching engines, verifying duration when available.
+
+    Tries ytsearch1, ytmusicsearch1 and scsearch1 in order, skipping results whose
+    duration does not match the expected value (a common source of "wrong song" hits).
+    """
     query_str = f"{artist} - {title}"
-    try:
-        return await download_ytdlp(
-            f"ytsearch1:{query_str}",
-            want_audio=True,
-            tmpdir=tmpdir,
-            on_progress=on_progress,
-            audio_format=audio_format,
-            music_artist=artist,
-            music_title=title,
-            thumb_url=thumb_url,
-            should_cancel=should_cancel,
-        )
-    except Exception as err: # noqa: BLE001
-        log.warning("YouTube search failed for %r (%s), trying SoundCloud fallback...", query_str, err)
-        if on_progress:
-            await on_progress(get_text(lang, "dl_yt_search_fallback"))
+    queries = [
+        f"ytsearch1:{query_str}",
+        f"ytmusicsearch1:{query_str}",
+        f"scsearch1:{query_str}",
+    ]
+    last_err: Exception | None = None
+    for query in queries:
         for item in tmpdir.iterdir():
             try:
                 if item.is_file():
                     item.unlink()
-            except Exception: # noqa: BLE001
+            except Exception:  # noqa: BLE001
                 log.debug("Failed to unlink %r", item)
-        return await download_ytdlp(
-            f"scsearch1:{query_str}",
-            want_audio=True,
-            tmpdir=tmpdir,
-            on_progress=on_progress,
-            audio_format=audio_format,
-            music_artist=artist,
-            music_title=title,
-            thumb_url=thumb_url,
-            should_cancel=should_cancel,
-        )
+        try:
+            result = await download_ytdlp(
+                query,
+                want_audio=True,
+                tmpdir=tmpdir,
+                on_progress=on_progress,
+                audio_format=audio_format,
+                music_artist=artist,
+                music_title=title,
+                thumb_url=thumb_url,
+                should_cancel=should_cancel,
+            )
+        except (DownloadCancelled, FileTooLarge):
+            raise
+        except Exception as err:  # noqa: BLE001
+            last_err = err
+            log.warning("Search %r failed (%s), trying next...", query, err)
+            continue
+        if expected_duration is None or result.duration <= 0 or _duration_matches(result.duration, expected_duration):
+            return result
+        last_err = RuntimeError(f"duration mismatch: got {result.duration}s, expected {expected_duration}s")
+        log.warning("Search %r returned wrong duration (%ss vs %ss), trying next...", query, result.duration, expected_duration)
+    raise TrackNotFound(f"{query_str}: {last_err}") from last_err
 
 
 async def download_simple(url: str, tmpdir: Path, on_progress: ProgressCallback | None = None,

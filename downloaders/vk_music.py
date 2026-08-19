@@ -1,19 +1,26 @@
 """VK Music downloader module interacting with VK API method endpoints."""
 
 import json
+import logging
 import re
 from pathlib import Path
 
 import httpx
 
+from config import config
 from downloaders.collections import _process_collection_tracks
 from downloaders.core import (
     CancelCheck,
+    DownloadCancelled,
     DownloadResult,
+    FileTooLarge,
     ProgressCallback,
     _download_track_search,
+    download_ytdlp,
 )
 from downloaders.http import get_http_client
+
+log = logging.getLogger("mediabot.vk_music")
 
 VK_API_URL = "https://api.vk.com/method"
 VK_CLIENT_ID = "6287487"
@@ -24,6 +31,10 @@ VK_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/149.0.0.0 Safari/537.36"
 )
+
+
+class ProfileClosedError(RuntimeError):
+    """Raised when a VK profile's audio is inaccessible (private, non-user, or no token)."""
 
 
 async def _vk_api_request(url: str, params: dict) -> dict:
@@ -142,12 +153,108 @@ async def _vk_get_audios_by_id(token: str, audio_ids: list[str]) -> list[dict]:
                 "audios": ",".join(chunk),
                 "client_secret": VK_CLIENT_SECRET,
                 "access_token": token,
+                "extra_fields": "owner,duration",
             },
         )
         if "error" in data:
             raise RuntimeError(f"VK audio.getById error: {data['error']}")
         results.extend(data.get("response", []))
     return results
+
+
+async def resolve_owner_id(screen_name: str) -> str:
+    """Resolve a VK screen name / id to a numeric owner id. Raises ProfileClosedError if not a user."""
+    if screen_name.startswith("id") and screen_name[2:].isdigit():
+        return screen_name[2:]
+    token = await _vk_get_anon_token()
+    data = await _vk_api_request(
+        f"{VK_API_URL}/utils.resolveScreenName",
+        {"v": VK_API_VERSION, "screen_name": screen_name, "access_token": token},
+    )
+    if "error" in data:
+        raise ProfileClosedError(f"resolveScreenName error: {data['error'].get('error_msg', data['error'])}")
+    resp = data.get("response", {})
+    if not resp or resp.get("type") != "user":
+        raise ProfileClosedError(f"not a user profile: {screen_name}")
+    return str(resp["object_id"])
+
+
+async def list_vk_user_tracks(owner_id: str, token: str | None = None) -> list[dict]:
+    """List all public audio of a VK user via audio.get.
+
+    Uses the provided token, falling back to the configured VK_ACCESS_TOKEN.
+    Requires a personal (non-anonymous) token; the anonymous token cannot enumerate.
+    """
+    token = token or config.VK_ACCESS_TOKEN
+    if not token:
+        raise ProfileClosedError("VK_ACCESS_TOKEN not configured")
+    all_tracks: list[dict] = []
+    offset = 0
+    while True:
+        data = await _vk_api_request(
+            f"{VK_API_URL}/audio.get",
+            {
+                "v": VK_API_VERSION,
+                "owner_id": owner_id,
+                "count": "200",
+                "offset": str(offset),
+                "access_token": token,
+            },
+        )
+        if "error" in data:
+            code = data["error"].get("error_code")
+            # 5 = bad token, 15/30/201 = access denied / private profile
+            raise ProfileClosedError(f"audio.get error {code}: {data['error'].get('error_msg', '')}")
+        items = data.get("response", {}).get("items", [])
+        if not items:
+            break
+        all_tracks.extend(items)
+        offset += len(items)
+        if len(items) < 200:
+            break
+    return all_tracks
+
+
+async def fetch_vk_track(
+    track: dict,
+    audio_format: str,
+    tmpdir: Path,
+    should_cancel: CancelCheck | None = None,
+    lang: str = "ru",
+    on_progress: ProgressCallback | None = None,
+) -> DownloadResult:
+    """Download a single VK track: direct mp3 URL when available, YouTube search fallback otherwise."""
+    artist = track.get("artist") or "Unknown"
+    title = track.get("title") or "Track"
+    duration = track.get("duration")
+    thumb_url = (track.get("thumb") or {}).get("photo_600") or (track.get("album", {}).get("thumb") or {}).get("photo_600")
+    direct_url = track.get("url")
+    if direct_url:
+        try:
+            return await download_ytdlp(
+                direct_url,
+                want_audio=True,
+                tmpdir=tmpdir,
+                on_progress=on_progress,
+                audio_format=audio_format,
+                music_title=title,
+                music_artist=artist,
+                thumb_url=thumb_url,
+                should_cancel=should_cancel,
+            )
+        except (DownloadCancelled, FileTooLarge):
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.warning("direct VK download failed for %s - %s, falling back to search: %s", artist, title, e)
+    return await _download_track_search(
+        artist, title, tmpdir,
+        on_progress=on_progress,
+        audio_format=audio_format,
+        thumb_url=thumb_url,
+        should_cancel=should_cancel,
+        lang=lang,
+        expected_duration=duration,
+    )
 
 
 async def download_vk_music(
@@ -195,6 +302,7 @@ async def download_vk_music(
             audio_format=audio_format,
             thumb_url=thumb_url or None,
             should_cancel=should_cancel,
+            expected_duration=track.get("duration"),
         )
     owner_id = params["owner_id"]
     playlist_id = params["playlist_id"]
@@ -224,6 +332,7 @@ async def download_vk_music(
             audio_format=audio_format,
             thumb_url=track_thumb,
             should_cancel=should_cancel,
+            expected_duration=track.get("duration"),
         )
     return await _process_collection_tracks(
         tracks, album_title, cover_url, tmpdir,

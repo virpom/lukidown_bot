@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import re
+import tempfile
 import time
 from pathlib import Path
 
@@ -35,11 +36,12 @@ from downloaders import (
     get_available_video_heights,
     list_episodes,
 )
-from downloaders.core import _human_size
+from downloaders.core import _ensure_dir, _human_size, TrackNotFound
+from downloaders.vk_music import ProfileClosedError, fetch_vk_track, list_vk_user_tracks, resolve_owner_id
 from health import init as health_init
 from health import start_health_server
 from i18n import EMOJI_RU, EMOJI_US, get_text
-from platforms import Platform, detect_platform, extract_url
+from platforms import Platform, detect_platform, extract_url, extract_vk_token, is_vk_profile, vk_profile_name
 from services import CacheEntry, QueueTask, media_service
 
 logging.basicConfig(
@@ -94,6 +96,12 @@ EMOJI_BACK = "5255703720078879038"
 EMOJI_AUDIO = "5402595016101078333"
 EMOJI_VIDEO = "5337301488748211009"
 EMOJI_MIC = "5382013970905309819"
+
+VK_OAUTH_URL = (
+    "https://oauth.vk.com/authorize?client_id=6287487&display=page"
+    "&redirect_uri=https://oauth.vk.com/blank.html&scope=offline,audio"
+    "&response_type=token&v=5.131&revoke=1"
+)
 
 
 def _platform_to_json(platform: Platform) -> str:
@@ -514,7 +522,7 @@ async def _send_cached_media(chat_id: int, entry: CacheEntry, lang: str = "ru"):
         return await app.send_document(chat_id, document=entry.file_id, caption=caption, parse_mode=ParseMode.MARKDOWN)
 
 
-async def send_result(chat_id: int, result, status_msg: Message, url: str | None = None, lang: str = "ru"):
+async def send_result(chat_id: int, result, status_msg: Message, url: str | None = None, lang: str = "ru", keep_status: bool = False):
     """Send downloaded media result file to specified Telegram chat."""
     cap = _caption(result, url, lang=lang)
     fp = result.filepath
@@ -642,7 +650,8 @@ async def send_result(chat_id: int, result, status_msg: Message, url: str | None
             raise
         media_type = "document"
 
-    await _safe_delete(status_msg)
+    if not keep_status:
+        await _safe_delete(status_msg)
     return sent_message, media_type
 
 
@@ -695,6 +704,7 @@ async def _enqueue_download(
         season: int | None = None,
         episode: int | None = None,
         translation_id: int | None = None,
+        vk_token: str | None = None,
 ):
     """Create and push a new download QueueTask into Redis queue."""
     media_key = await media_service.compute_media_key(
@@ -732,6 +742,7 @@ async def _enqueue_download(
         season=season,
         episode=episode,
         translation_id=translation_id,
+        vk_token=vk_token,
     )
     await media_service.queue.enqueue(task)
     user_lang = (await media_service.storage.get_user_language(user_id)) or "ru"
@@ -742,6 +753,94 @@ async def _enqueue_download(
     else:
         text = get_text(user_lang, "task_processing_started")
         await _safe_edit(status_msg, text, reply_markup=_keyboard_cancel(user_lang))
+
+
+async def _process_vk_user_stream(task: QueueTask, status_msg: Message | None, user_lang: str):
+    """Stream-download every public audio track of a VK user, one message per track."""
+    name = vk_profile_name(task.url or "")
+    if not name:
+        raise ProfileClosedError("bad profile url")
+    if status_msg:
+        await _safe_edit(status_msg, get_text(user_lang, "vk_getting_user_audio"), reply_markup=_keyboard_cancel(user_lang))
+
+    owner_id = await resolve_owner_id(name)
+    tracks = await list_vk_user_tracks(owner_id, token=task.vk_token)
+    if not tracks:
+        raise ProfileClosedError("no public audio")
+    total = len(tracks)
+    sent = 0
+    skipped = 0
+
+    for idx, t in enumerate(tracks, start=1):
+        if media_service.queue.is_cancel_requested_sync(task.user_id):
+            raise DownloadCancelled("download cancelled")
+        artist = t.get("artist") or "Unknown"
+        title = t.get("title") or f"Track {idx}"
+
+        media_key = await media_service.compute_media_key(
+            url=None,
+            platform=Platform.VK_MUSIC,
+            want_audio=True,
+            audio_format=task.audio_format,
+            video_quality=task.video_quality,
+            search_query=None,
+            music_title=title,
+            music_artist=artist,
+        )
+        cached = await media_service.storage.get_cache(media_key)
+        if cached:
+            await _send_cached_media(task.chat_id, cached, lang=user_lang)
+            await media_service.storage.add_history(task.user_id, media_key)
+            sent += 1
+            continue
+
+        if status_msg:
+            await _safe_edit(status_msg, get_text(user_lang, "vk_download_progress", idx=idx, total=total, artist=artist, title=title), reply_markup=_keyboard_cancel(user_lang))
+        track_tmpdir = Path(tempfile.mkdtemp(dir=_ensure_dir(config.DOWNLOAD_DIR)))
+        try:
+            result = await fetch_vk_track(
+                t, task.audio_format, track_tmpdir,
+                should_cancel=lambda: media_service.queue.is_cancel_requested_sync(task.user_id),
+                lang=user_lang,
+            )
+            sent_message, media_type = await send_result(task.chat_id, result, status_msg, url=None, lang=user_lang, keep_status=True)
+            if sent_message and sent_message.audio:
+                await media_service.storage.save_cache(
+                    media_key=media_key,
+                    file_id=sent_message.audio.file_id,
+                    media_type="audio",
+                    media_format=task.audio_format,
+                    title=title,
+                    performer=artist,
+                )
+                await media_service.storage.add_history(task.user_id, media_key)
+            sent += 1
+        except TrackNotFound:
+            skipped += 1
+            log.warning("track not found: %s - %s", artist, title)
+        finally:
+            cleanup(track_tmpdir)
+
+    if status_msg:
+        await _safe_edit(status_msg, get_text(user_lang, "vk_download_done", sent=sent, skipped=skipped))
+
+
+async def _run_vk_user_stream(task: QueueTask, status_msg: Message | None, user_lang: str):
+    """Wrap the VK user stream with error handling and queue cleanup."""
+    try:
+        await _process_vk_user_stream(task, status_msg, user_lang)
+    except DownloadCancelled:
+        await media_service.queue.clear_cancel(task.user_id)
+        await _safe_edit(status_msg, get_text(user_lang, "cancel_done"))
+    except ProfileClosedError as e:
+        log.warning("vk profile error: %s", e)
+        await _safe_edit(status_msg, get_text(user_lang, "vk_profile_closed"))
+    except Exception:
+        log.exception("vk user download failed for task %s", task.task_id)
+        await _safe_edit(status_msg, get_text(user_lang, "download_error"))
+    finally:
+        await media_service.queue.clear_active(task.user_id, task.task_id)
+        asyncio.create_task(_update_waiting_queue_positions())
 
 
 async def _process_queued_download(task: QueueTask):
@@ -768,6 +867,10 @@ async def _process_queued_download(task: QueueTask):
 
     def should_cancel() -> bool:
         return media_service.queue.is_cancel_requested_sync(task.user_id)
+
+    if task.platform == Platform.VK_MUSIC.value and is_vk_profile(task.url or ""):
+        await _run_vk_user_stream(task, status_msg, user_lang)
+        return
 
     result = None
     try:
@@ -1031,6 +1134,34 @@ async def cmd_search(client: Client, msg: Message):
     })
 
 
+@app.on_message(filters.text & filters.regex(r"access_token="))
+async def handle_vk_oauth(client: Client, msg: Message):
+    """Handle a pasted VK OAuth redirect URL, storing its token and continuing a pending profile download."""
+    lang = await _ensure_user_lang(msg)
+    if not lang:
+        return
+    token = extract_vk_token(msg.text)
+    if not token:
+        return
+    pending = await media_service.pending.pop(f"vk_auth:{msg.from_user.id}")
+    if not pending:
+        await msg.reply_text(get_text(lang, "vk_auth_no_pending"))
+        return
+
+    reply = await msg.reply_text(
+        get_text(lang, "select_audio_format"),
+        reply_markup=_keyboard_audio_format(_YOUTUBE_CODECS, show_back=False, lang=lang),
+    )
+    await media_service.pending.set(f"{msg.chat.id}:{reply.id}", {
+        "url": pending["url"],
+        "platform": _platform_to_json(Platform.VK_MUSIC),
+        "want_audio": True,
+        "available_codecs": list(_YOUTUBE_CODECS),
+        "user_id": msg.from_user.id,
+        "vk_token": token,
+    })
+
+
 @app.on_message(filters.text & ~filters.command(["start", "settings", "help", "queue", "cancel", "saves", "search"]))
 async def handle_url(client: Client, msg: Message):
     """Handle incoming text messages containing media URLs."""
@@ -1041,7 +1172,7 @@ async def handle_url(client: Client, msg: Message):
     if not url:
         return
 
-    platform = detect_platform(url)
+    platform = Platform.VK_MUSIC if is_vk_profile(url) else detect_platform(url)
     if platform == Platform.UNKNOWN:
         await msg.reply_text(get_text(lang, "unsupported_platform"))
         return
@@ -1098,6 +1229,15 @@ async def handle_url(client: Client, msg: Message):
                 get_text(lang, "kp_movie_tr"),
                 reply_markup=_keyboard_kp_translations(info["translations"]),
             )
+        return
+
+    if platform == Platform.VK_MUSIC and is_vk_profile(url) and not config.VK_ACCESS_TOKEN:
+        await msg.reply_text(get_text(lang, "vk_auth_needed") + "\n\n" + VK_OAUTH_URL)
+        await media_service.pending.set(f"vk_auth:{msg.from_user.id}", {
+            "url": url,
+            "platform": _platform_to_json(Platform.VK_MUSIC),
+            "user_id": msg.from_user.id,
+        })
         return
 
     if platform in (Platform.SPOTIFY, Platform.SHAZAM, Platform.YANDEX, Platform.SOUNDCLOUD, Platform.VK_MUSIC):
@@ -1229,6 +1369,7 @@ async def cb_audio_format(client: Client, cq: CallbackQuery):
         season=state.get("season"),
         episode=state.get("episode"),
         translation_id=state.get("translation_id"),
+        vk_token=state.get("vk_token"),
     )
 
 
