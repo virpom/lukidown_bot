@@ -19,6 +19,7 @@ from downloaders.core import (
     _base_ydl_opts,
     _safe_filename,
     download_ytdlp,
+    progress_bar,
 )
 from downloaders.http import get_http_client
 
@@ -89,6 +90,8 @@ async def _process_collection_tracks(
         shutil.move(str(result.filepath), str(dest_path))
         shutil.rmtree(track_tmpdir, ignore_errors=True)
         done_count += 1
+        if on_progress:
+            await on_progress(f"{progress_bar(done_count, total)} {done_count}/{total} · {track.get('title', 'Unknown')}")
     results = await asyncio.gather(
         *[_dl_one(idx, track) for idx, track in enumerate(tracks, start=1)],
         return_exceptions=True,

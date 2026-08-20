@@ -36,6 +36,7 @@ QUEUE_KEY = "download_queue"
 PROCESSING_COUNT_KEY = "processing_count"
 USER_QUEUE_KEY = "user_queue:{user_id}"
 ACTIVE_TASK_KEY = "active_task:{user_id}"
+ACTIVE_COUNT_KEY = "active_count:{user_id}"
 CANCEL_FLAG_KEY = "cancel_flag:{user_id}"
 TASK_DATA_KEY = "task_data:{task_id}"
 TASK_STATUS_KEY = "task_status:{task_id}"
@@ -370,6 +371,7 @@ class QueueManager:
         async with self.redis.pipeline(transaction=True) as pipe:
             await (
                 pipe.set(ACTIVE_TASK_KEY.format(user_id=user_id), message_id)
+                .incr(ACTIVE_COUNT_KEY.format(user_id=user_id))
                 .incr(PROCESSING_COUNT_KEY)
                 .execute()
             )
@@ -378,14 +380,18 @@ class QueueManager:
         """Clear active status and cleanup Redis task data after completion."""
         async with self.redis.pipeline(transaction=True) as pipe:
             await (
-                pipe.delete(ACTIVE_TASK_KEY.format(user_id=user_id))
-                .delete(CANCEL_FLAG_KEY.format(user_id=user_id))
-                .lrem(USER_QUEUE_KEY.format(user_id=user_id), 0, task_id)
+                pipe.lrem(USER_QUEUE_KEY.format(user_id=user_id), 0, task_id)
                 .delete(TASK_DATA_KEY.format(task_id=task_id))
                 .delete(TASK_STATUS_KEY.format(task_id=task_id))
                 .execute()
             )
-        self._cancel_set.discard(user_id)
+        active_key = ACTIVE_COUNT_KEY.format(user_id=user_id)
+        remaining = await self.redis.decr(active_key)
+        if remaining <= 0:
+            await self.redis.delete(active_key)
+            await self.redis.delete(ACTIVE_TASK_KEY.format(user_id=user_id))
+            await self.redis.delete(CANCEL_FLAG_KEY.format(user_id=user_id))
+            self._cancel_set.discard(user_id)
         current = int(await self.redis.get(PROCESSING_COUNT_KEY) or 0)
         if current > 0:
             await self.redis.decr(PROCESSING_COUNT_KEY)

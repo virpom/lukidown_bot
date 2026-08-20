@@ -188,6 +188,7 @@ async def list_vk_user_tracks(owner_id: str, token: str | None = None) -> list[d
     token = token or config.VK_ACCESS_TOKEN
     if not token:
         raise ProfileClosedError("VK_ACCESS_TOKEN not configured")
+    total = 0
     all_tracks: list[dict] = []
     offset = 0
     while True:
@@ -205,13 +206,16 @@ async def list_vk_user_tracks(owner_id: str, token: str | None = None) -> list[d
             code = data["error"].get("error_code")
             # 5 = bad token, 15/30/201 = access denied / private profile
             raise ProfileClosedError(f"audio.get error {code}: {data['error'].get('error_msg', '')}")
-        items = data.get("response", {}).get("items", [])
+        resp = data.get("response", {})
+        items = resp.get("items", [])
         if not items:
             break
         all_tracks.extend(items)
+        total = resp.get("count", 0)
         offset += len(items)
-        if len(items) < 200:
+        if len(all_tracks) >= total:
             break
+    log.info("vk user %s: listed %d tracks (vk total count=%d)", owner_id, len(all_tracks), total)
     return all_tracks
 
 

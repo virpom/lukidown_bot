@@ -91,6 +91,14 @@ def _human_size(n: int) -> str:
     return f"{n:.1f} TB"
 
 
+def progress_bar(done: int, total: int, width: int = 10) -> str:
+    """Render a text progress bar like [████░░░░░░]."""
+    if total <= 0:
+        return "[" + "?" * width + "]"
+    filled = max(0, min(width, round(width * done / total)))
+    return "[" + "█" * filled + "░" * (width - filled) + "]"
+
+
 def _is_format_unavailable(error: Exception) -> bool:
     """Check if exception indicates requested media format was missing."""
     return "Requested format is not available" in str(error)

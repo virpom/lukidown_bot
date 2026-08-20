@@ -10,7 +10,8 @@ import time
 from pathlib import Path
 
 from pyrogram import Client, filters, idle
-from pyrogram.enums import ButtonStyle, ParseMode
+from pyrogram.enums import ButtonStyle, ChatType, ParseMode
+from pyrogram.errors import FloodWait
 from pyrogram.types import (
     CallbackQuery,
     ChosenInlineResult,
@@ -36,7 +37,7 @@ from downloaders import (
     get_available_video_heights,
     list_episodes,
 )
-from downloaders.core import _ensure_dir, _human_size, TrackNotFound
+from downloaders.core import _ensure_dir, _human_size, progress_bar, TrackNotFound
 from downloaders.vk_music import ProfileClosedError, fetch_vk_track, list_vk_user_tracks, resolve_owner_id
 from health import init as health_init
 from health import start_health_server
@@ -398,7 +399,7 @@ async def _store_inline_cache(user_id: int, media_key: str, result, want_audio: 
     user_lang = (await media_service.storage.get_user_language(user_id)) or "ru"
     try:
         if want_audio:
-            shadow_message = await app.send_audio(
+            shadow_message = await _send_with_flood_retry(lambda: app.send_audio(
                 chat_id=user_id,
                 audio=str(result.filepath),
                 caption=_caption(result, url, lang=user_lang),
@@ -407,7 +408,7 @@ async def _store_inline_cache(user_id: int, media_key: str, result, want_audio: 
                 thumb=str(result.thumbnail) if result.thumbnail and result.thumbnail.exists() else None,
                 disable_notification=True,
                 parse_mode=ParseMode.MARKDOWN,
-            )
+            ))
         else:
             v_width, v_height, v_duration, v_thumb = await _ensure_video_info(result.filepath, result)
             kwargs = {
@@ -426,7 +427,7 @@ async def _store_inline_cache(user_id: int, media_key: str, result, want_audio: 
                 kwargs["duration"] = v_duration
             if v_thumb:
                 kwargs["thumb"] = str(v_thumb)
-            shadow_message = await app.send_video(**kwargs)
+            shadow_message = await _send_with_flood_retry(lambda: app.send_video(**kwargs))
 
         file_id = None
         media_type = None
@@ -504,22 +505,33 @@ def get_stable_id(query: str, fmt: str) -> str:
     return f"{fmt}_{hash_str}"
 
 
+async def _send_with_flood_retry(factory):
+    """Run a send coroutine factory, sleeping and retrying on Telegram FloodWait."""
+    while True:
+        try:
+            return await factory()
+        except FloodWait as e:
+            wait = float(getattr(e, "value", 0) or 30)
+            log.warning("FloodWait %ss, sleeping before retrying send", wait)
+            await asyncio.sleep(wait + 1)
+
+
 async def _send_cached_media(chat_id: int, entry: CacheEntry, lang: str = "ru"):
     """Send media file using cached Telegram file_id."""
     caption = _cache_caption(entry, lang=lang)
     try:
         if entry.media_type == "audio":
-            return await app.send_audio(chat_id, audio=entry.file_id, caption=caption, parse_mode=ParseMode.MARKDOWN)
+            return await _send_with_flood_retry(lambda: app.send_audio(chat_id, audio=entry.file_id, caption=caption, parse_mode=ParseMode.MARKDOWN))
         if entry.media_type == "video":
-            return await app.send_video(chat_id, video=entry.file_id, caption=caption, parse_mode=ParseMode.MARKDOWN)
+            return await _send_with_flood_retry(lambda: app.send_video(chat_id, video=entry.file_id, caption=caption, parse_mode=ParseMode.MARKDOWN))
         if entry.media_type == "photo":
-            return await app.send_photo(chat_id, photo=entry.file_id, caption=caption, parse_mode=ParseMode.MARKDOWN)
-        return await app.send_document(chat_id, document=entry.file_id, caption=caption, parse_mode=ParseMode.MARKDOWN)
+            return await _send_with_flood_retry(lambda: app.send_photo(chat_id, photo=entry.file_id, caption=caption, parse_mode=ParseMode.MARKDOWN))
+        return await _send_with_flood_retry(lambda: app.send_document(chat_id, document=entry.file_id, caption=caption, parse_mode=ParseMode.MARKDOWN))
     except ValueError as e:
 
         log.warning("cached media_type=%s mismatched real file type, falling back to document: %s",
                     entry.media_type, e)
-        return await app.send_document(chat_id, document=entry.file_id, caption=caption, parse_mode=ParseMode.MARKDOWN)
+        return await _send_with_flood_retry(lambda: app.send_document(chat_id, document=entry.file_id, caption=caption, parse_mode=ParseMode.MARKDOWN))
 
 
 async def send_result(chat_id: int, result, status_msg: Message, url: str | None = None, lang: str = "ru", keep_status: bool = False):
@@ -567,12 +579,12 @@ async def send_result(chat_id: int, result, status_msg: Message, url: str | None
             if thumb_path:
                 kwargs["thumb"] = thumb_path
             try:
-                sent_message = await app.send_audio(**kwargs)
+                sent_message = await _send_with_flood_retry(lambda: app.send_audio(**kwargs))
             except Exception as err: # noqa: BLE001
                 log.warning("send_audio failed (%s), retrying without thumb & progress...", err)
                 kwargs.pop("thumb", None)
                 kwargs.pop("progress", None)
-                sent_message = await app.send_audio(**kwargs)
+                sent_message = await _send_with_flood_retry(lambda: app.send_audio(**kwargs))
             media_type = "audio"
         elif suffix in (".mp4", ".mkv", ".webm", ".mov", ".avi"):
             v_width, v_height, v_duration, v_thumb = await _ensure_video_info(fp, result)
@@ -593,30 +605,30 @@ async def send_result(chat_id: int, result, status_msg: Message, url: str | None
             if v_duration > 0:
                 kwargs["duration"] = v_duration
             try:
-                sent_message = await app.send_video(**kwargs)
+                sent_message = await _send_with_flood_retry(lambda: app.send_video(**kwargs))
             except Exception as err: # noqa: BLE001
                 log.warning("send_video failed (%s), retrying without thumb & progress...", err)
                 kwargs.pop("thumb", None)
                 kwargs.pop("progress", None)
-                sent_message = await app.send_video(**kwargs)
+                sent_message = await _send_with_flood_retry(lambda: app.send_video(**kwargs))
             media_type = "video"
         elif suffix in (".jpg", ".jpeg", ".png", ".webp"):
             try:
-                sent_message = await app.send_photo(
+                sent_message = await _send_with_flood_retry(lambda: app.send_photo(
                     chat_id,
                     photo=str(fp),
                     caption=cap,
                     parse_mode=ParseMode.MARKDOWN,
                     progress=upload_progress,
-                )
+                ))
             except Exception as err: # noqa: BLE001
                 log.warning("send_photo failed (%s), retrying without progress...", err)
-                sent_message = await app.send_photo(
+                sent_message = await _send_with_flood_retry(lambda: app.send_photo(
                     chat_id,
                     photo=str(fp),
                     caption=cap,
                     parse_mode=ParseMode.MARKDOWN,
-                )
+                ))
             media_type = "photo"
         else:
             kwargs = {
@@ -629,22 +641,22 @@ async def send_result(chat_id: int, result, status_msg: Message, url: str | None
             if thumb_path:
                 kwargs["thumb"] = thumb_path
             try:
-                sent_message = await app.send_document(**kwargs)
+                sent_message = await _send_with_flood_retry(lambda: app.send_document(**kwargs))
             except Exception as err: # noqa: BLE001
                 log.warning("send_document failed (%s), retrying without thumb & progress...", err)
                 kwargs.pop("thumb", None)
                 kwargs.pop("progress", None)
-                sent_message = await app.send_document(**kwargs)
+                sent_message = await _send_with_flood_retry(lambda: app.send_document(**kwargs))
             media_type = "document"
     except Exception as e:  # noqa: BLE001
         log.warning("send as media failed, fallback to raw document: %s", e)
         try:
-            sent_message = await app.send_document(
+            sent_message = await _send_with_flood_retry(lambda: app.send_document(
                 chat_id,
                 document=str(fp),
                 caption=cap,
                 parse_mode=ParseMode.MARKDOWN,
-            )
+            ))
         except Exception as fallback_err:
             log.error("Final fallback send_document failed: %s", fallback_err)
             raise
@@ -755,6 +767,26 @@ async def _enqueue_download(
         await _safe_edit(status_msg, text, reply_markup=_keyboard_cancel(user_lang))
 
 
+def _send_delay(status_msg) -> float:
+    """Return per-chat send delay: groups are rate-limited harder than private chats."""
+    if status_msg is not None and status_msg.chat and status_msg.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return config.SEND_DELAY_GROUP_SECONDS
+    return config.SEND_DELAY_PRIVATE_SECONDS
+
+
+async def _vk_stream_progress(status_msg, last_update, idx, total, artist, title, user_lang):
+    """Throttled progress-bar status edit for the VK user stream."""
+    if not status_msg:
+        return
+    now = time.time()
+    if now - last_update[0] < 1.5 and idx != total:
+        return
+    last_update[0] = now
+    bar = progress_bar(idx - 1, total)
+    pct = ((idx - 1) / total * 100) if total else 0
+    await _safe_edit(status_msg, get_text(user_lang, "vk_download_progress", bar=bar, pct=pct, idx=idx, total=total, artist=artist, title=title), reply_markup=_keyboard_cancel(user_lang))
+
+
 async def _process_vk_user_stream(task: QueueTask, status_msg: Message | None, user_lang: str):
     """Stream-download every public audio track of a VK user, one message per track."""
     name = vk_profile_name(task.url or "")
@@ -770,12 +802,16 @@ async def _process_vk_user_stream(task: QueueTask, status_msg: Message | None, u
     total = len(tracks)
     sent = 0
     skipped = 0
+    last_update = [0.0]
+    delay = _send_delay(status_msg)
 
     for idx, t in enumerate(tracks, start=1):
         if media_service.queue.is_cancel_requested_sync(task.user_id):
             raise DownloadCancelled("download cancelled")
         artist = t.get("artist") or "Unknown"
         title = t.get("title") or f"Track {idx}"
+
+        await _vk_stream_progress(status_msg, last_update, idx, total, artist, title, user_lang)
 
         media_key = await media_service.compute_media_key(
             url=None,
@@ -792,10 +828,9 @@ async def _process_vk_user_stream(task: QueueTask, status_msg: Message | None, u
             await _send_cached_media(task.chat_id, cached, lang=user_lang)
             await media_service.storage.add_history(task.user_id, media_key)
             sent += 1
+            await asyncio.sleep(delay)
             continue
 
-        if status_msg:
-            await _safe_edit(status_msg, get_text(user_lang, "vk_download_progress", idx=idx, total=total, artist=artist, title=title), reply_markup=_keyboard_cancel(user_lang))
         track_tmpdir = Path(tempfile.mkdtemp(dir=_ensure_dir(config.DOWNLOAD_DIR)))
         try:
             result = await fetch_vk_track(
@@ -815,6 +850,7 @@ async def _process_vk_user_stream(task: QueueTask, status_msg: Message | None, u
                 )
                 await media_service.storage.add_history(task.user_id, media_key)
             sent += 1
+            await asyncio.sleep(delay)
         except TrackNotFound:
             skipped += 1
             log.warning("track not found: %s - %s", artist, title)
@@ -830,7 +866,6 @@ async def _run_vk_user_stream(task: QueueTask, status_msg: Message | None, user_
     try:
         await _process_vk_user_stream(task, status_msg, user_lang)
     except DownloadCancelled:
-        await media_service.queue.clear_cancel(task.user_id)
         await _safe_edit(status_msg, get_text(user_lang, "cancel_done"))
     except ProfileClosedError as e:
         log.warning("vk profile error: %s", e)
@@ -859,10 +894,13 @@ async def _process_queued_download(task: QueueTask):
         return
 
     last_progress = [""]
+    last_progress_ts = [0.0]
 
     async def on_progress(text: str):
-        if text != last_progress[0]:
+        now = time.time()
+        if text != last_progress[0] and now - last_progress_ts[0] >= 1.5:
             last_progress[0] = text
+            last_progress_ts[0] = now
             await _safe_edit(status_msg, text, reply_markup=_keyboard_cancel(user_lang))
 
     def should_cancel() -> bool:
@@ -922,7 +960,6 @@ async def _process_queued_download(task: QueueTask):
         log.warning("Download task %s timed out after %s seconds", task.task_id, config.TASK_TIMEOUT_SECONDS)
         await _safe_edit(status_msg, get_text(user_lang, "download_timeout"))
     except DownloadCancelled:
-        await media_service.queue.clear_cancel(task.user_id)
         await _safe_edit(status_msg, get_text(user_lang, "cancel_done"))
     except FileTooLarge:
         await _safe_edit(status_msg, get_text(user_lang, "file_too_large", limit=config.MAX_FILE_SIZE_MB))

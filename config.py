@@ -31,6 +31,8 @@ class Config:
     HISTORY_LIMIT: int = field(default_factory=lambda: int(os.getenv("HISTORY_LIMIT", "10")))
     REDDIT_COOKIE: str = field(default_factory=lambda: os.getenv('REDDIT_COOKIE', ''))
     VK_ACCESS_TOKEN: str = field(default_factory=lambda: os.getenv('VK_ACCESS_TOKEN', ''))
+    SEND_DELAY_PRIVATE_SECONDS: float = field(default_factory=lambda: float(os.getenv("SEND_DELAY_PRIVATE_SECONDS", "1")))
+    SEND_DELAY_GROUP_SECONDS: float = field(default_factory=lambda: float(os.getenv("SEND_DELAY_GROUP_SECONDS", "5")))
 
     def validate(self):
         """Validate that all required configuration variables are present.
