@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import re
+import shutil
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -18,6 +19,17 @@ from config import config
 from downloaders.http import get_http_client
 
 log = logging.getLogger("mediabot.core")
+
+_yt_backoff_until = 0.0
+_yt_fail_streak = 0
+_yt_lock = asyncio.Lock()
+_YT_DELAY = 5.0
+_YT_COOLDOWNS = (60, 300, 900)
+
+
+def _is_yt_signin_error(err: Exception) -> bool:
+    """Detect YouTube's anti-bot 'Sign in to confirm you're not a bot' error."""
+    return "Sign in to confirm" in str(err)
 
 
 @dataclass
@@ -537,6 +549,12 @@ async def download_ytdlp(
         ]
     max_bytes = config.MAX_FILE_SIZE_MB * 1024 * 1024
     is_search = url.startswith(("ytsearch", "ytmusicsearch", "gvsearch", "yvsearch", "scsearch"))
+    # ponytail: per-download cookie copy — concurrent yt-dlp write-backs clobber the shared file
+    cookie_src = Path("cookies.txt")
+    cookie_copy = None
+    if cookie_src.exists() and cookie_src.stat().st_size > 0:
+        cookie_copy = tmpdir / ".cookies.txt"
+        shutil.copyfile(cookie_src, cookie_copy)
     common_opts = {
         **_base_ydl_opts(),
         "outtmpl": str(tmpdir / "%(id)s.%(ext)s"),
@@ -546,12 +564,16 @@ async def download_ytdlp(
         "postprocessor_hooks": [_postprocessor_hook(sync_cb)],
         "postprocessor_args": postprocessor_args,
     }
+    if cookie_copy is not None:
+        common_opts["cookiefile"] = str(cookie_copy)
     if is_search:
         common_opts["noplaylist"] = False
 
     ydl_opts = {**common_opts, "format": fmt}
     def _get_info(opts: dict):
         preflight = {**_base_ydl_opts(), "skip_download": True, "format": opts.get("format", "best")}
+        if cookie_copy is not None:
+            preflight["cookiefile"] = str(cookie_copy)
         if is_search:
             preflight["noplaylist"] = False
         with yt_dlp.YoutubeDL(preflight) as ydl:
@@ -730,10 +752,15 @@ async def _download_track_search(
         f"ytsearch1:{query_str}",
         f"scsearch1:{query_str}",
     ]
+    global _yt_backoff_until, _yt_fail_streak
     last_err: Exception | None = None
     for query in queries:
+        is_yt = query.startswith("ytsearch")
         if should_cancel and should_cancel():
             raise DownloadCancelled("download cancelled by user")
+        if is_yt and time.time() < _yt_backoff_until:
+            async with _yt_lock:
+                await asyncio.sleep(_YT_DELAY)
         for item in tmpdir.iterdir():
             try:
                 if item.is_file():
@@ -756,8 +783,16 @@ async def _download_track_search(
             raise
         except Exception as err:  # noqa: BLE001
             last_err = err
+            if is_yt and _is_yt_signin_error(err):
+                _yt_fail_streak += 1
+                cooldown = _YT_COOLDOWNS[min(_yt_fail_streak - 1, len(_YT_COOLDOWNS) - 1)]
+                _yt_backoff_until = time.time() + cooldown
+                log.warning("YouTube anti-bot flag detected, backing off %ds (streak %d)", cooldown, _yt_fail_streak)
             log.warning("Search %r failed (%s), trying next...", query, err)
             continue
+        if is_yt:
+            _yt_fail_streak = 0
+            _yt_backoff_until = 0.0
         if expected_duration is None or result.duration <= 0 or _duration_matches(result.duration, expected_duration):
             return result
         last_err = RuntimeError(f"duration mismatch: got {result.duration}s, expected {expected_duration}s")

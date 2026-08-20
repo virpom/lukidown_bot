@@ -107,6 +107,8 @@ async def _process_collection_tracks(
     for r in results:
         if isinstance(r, DownloadCancelled):
             raise r
+    if done_count == 0:
+        raise RuntimeError("Could not download any tracks from this collection")
     zip_path = tmpdir / f"{album_name}.zip"
     shutil.make_archive(base_name=str(zip_path.with_suffix("")), format="zip", root_dir=str(album_dir))
     return DownloadResult(
