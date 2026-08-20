@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import shutil
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from downloaders.core import (
     DownloadResult,
     ProgressCallback,
     _base_ydl_opts,
+    _human_duration,
     _safe_filename,
     download_ytdlp,
     progress_bar,
@@ -69,13 +71,15 @@ async def _process_collection_tracks(
     total = len(tracks)
     sem = asyncio.Semaphore(5)
     done_count = 0
+    started = time.time()
     async def _dl_one(idx: int, track: dict):
         nonlocal done_count
-        if should_cancel and should_cancel():
-            raise DownloadCancelled("download cancelled by user")
         track_tmpdir = tmpdir / f"_track_{idx:03d}"
         track_tmpdir.mkdir(parents=True, exist_ok=True)
         async with sem:
+            if should_cancel and should_cancel():
+                shutil.rmtree(track_tmpdir, ignore_errors=True)
+                raise DownloadCancelled("download cancelled by user")
             try:
                 result = await download_one(track, idx, total, track_tmpdir)
             except DownloadCancelled:
@@ -91,7 +95,11 @@ async def _process_collection_tracks(
         shutil.rmtree(track_tmpdir, ignore_errors=True)
         done_count += 1
         if on_progress:
-            await on_progress(f"{progress_bar(done_count, total)} {done_count}/{total} · {track.get('title', 'Unknown')}")
+            eta = "…"
+            elapsed = time.time() - started
+            if done_count > 0 and elapsed > 0:
+                eta = "~" + _human_duration((total - done_count) * elapsed / done_count)
+            await on_progress(f"{progress_bar(done_count, total)} {done_count}/{total} · {eta} · {track.get('title', 'Unknown')}")
     results = await asyncio.gather(
         *[_dl_one(idx, track) for idx, track in enumerate(tracks, start=1)],
         return_exceptions=True,

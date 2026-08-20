@@ -91,6 +91,18 @@ def _human_size(n: int) -> str:
     return f"{n:.1f} TB"
 
 
+def _human_duration(sec: float) -> str:
+    """Format seconds as a compact human duration (45с / 2м 05с / 1ч 20м)."""
+    sec = max(0, int(sec))
+    if sec < 60:
+        return f"{sec}с"
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}ч {m:02d}м"
+    return f"{m}м {s:02d}с"
+
+
 def progress_bar(done: int, total: int, width: int = 10) -> str:
     """Render a text progress bar like [████░░░░░░]."""
     if total <= 0:
@@ -267,7 +279,7 @@ def _progress_hook(
         if speed:
             parts.append(f"{_human_size(speed)}/s")
         if eta:
-            parts.append(f"eta {eta}s")
+            parts.append(f"~{_human_duration(eta)}")
         cb(" / ".join(parts))
     return hook
 
@@ -710,17 +722,18 @@ async def _download_track_search(
 ) -> DownloadResult:
     """Download audio track by searching engines, verifying duration when available.
 
-    Tries ytsearch1, ytmusicsearch1 and scsearch1 in order, skipping results whose
+    Tries ytsearch1 and scsearch1 in order, skipping results whose
     duration does not match the expected value (a common source of "wrong song" hits).
     """
     query_str = f"{artist} - {title}"
     queries = [
         f"ytsearch1:{query_str}",
-        f"ytmusicsearch1:{query_str}",
         f"scsearch1:{query_str}",
     ]
     last_err: Exception | None = None
     for query in queries:
+        if should_cancel and should_cancel():
+            raise DownloadCancelled("download cancelled by user")
         for item in tmpdir.iterdir():
             try:
                 if item.is_file():

@@ -37,7 +37,7 @@ from downloaders import (
     get_available_video_heights,
     list_episodes,
 )
-from downloaders.core import _ensure_dir, _human_size, progress_bar, TrackNotFound
+from downloaders.core import _ensure_dir, _human_duration, _human_size, progress_bar, TrackNotFound
 from downloaders.vk_music import ProfileClosedError, fetch_vk_track, list_vk_user_tracks, resolve_owner_id
 from health import init as health_init
 from health import start_health_server
@@ -774,7 +774,29 @@ def _send_delay(status_msg) -> float:
     return config.SEND_DELAY_PRIVATE_SECONDS
 
 
-async def _vk_stream_progress(status_msg, last_update, idx, total, artist, title, user_lang):
+def _keyboard_vk_confirm(lang: str = "ru") -> InlineKeyboardMarkup:
+    """Inline keyboard with confirm/cancel buttons for large VK batch downloads."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(get_text(lang, "btn_confirm_yes"), callback_data="vk_confirm_yes"),
+            InlineKeyboardButton(get_text(lang, "btn_confirm_no"), callback_data="vk_confirm_no"),
+        ]
+    ])
+
+
+_VK_BITRATE_KBPS = {"flac": 900, "m4a": 256, "mp3_320": 320, "mp3_192": 192}
+
+
+def _estimate_vk_batch(tracks, audio_format, delay):
+    """Estimate size (MB) and time (seconds) for a VK track batch."""
+    total_duration = sum(int(t.get("duration") or 0) for t in tracks)
+    bitrate = _VK_BITRATE_KBPS.get(audio_format, 192)
+    est_mb = total_duration * bitrate / 8 / 1024
+    est_sec = len(tracks) * (12 + delay)
+    return est_mb, est_sec
+
+
+async def _vk_stream_progress(status_msg, last_update, started, idx, total, artist, title, user_lang):
     """Throttled progress-bar status edit for the VK user stream."""
     if not status_msg:
         return
@@ -784,7 +806,12 @@ async def _vk_stream_progress(status_msg, last_update, idx, total, artist, title
     last_update[0] = now
     bar = progress_bar(idx - 1, total)
     pct = ((idx - 1) / total * 100) if total else 0
-    await _safe_edit(status_msg, get_text(user_lang, "vk_download_progress", bar=bar, pct=pct, idx=idx, total=total, artist=artist, title=title), reply_markup=_keyboard_cancel(user_lang))
+    done = idx - 1
+    if done > 0 and now > started:
+        eta = "~" + _human_duration((total - done) * (now - started) / done)
+    else:
+        eta = "…"
+    await _safe_edit(status_msg, get_text(user_lang, "vk_download_progress", bar=bar, pct=pct, idx=idx, total=total, eta=eta, artist=artist, title=title), reply_markup=_keyboard_cancel(user_lang))
 
 
 async def _process_vk_user_stream(task: QueueTask, status_msg: Message | None, user_lang: str):
@@ -800,10 +827,39 @@ async def _process_vk_user_stream(task: QueueTask, status_msg: Message | None, u
     if not tracks:
         raise ProfileClosedError("no public audio")
     total = len(tracks)
+    delay = _send_delay(status_msg)
+
+    est_mb, est_sec = _estimate_vk_batch(tracks, task.audio_format, delay)
+    if total > 200 or est_sec > 1800 or est_mb > 1024:
+        confirm_key = f"vk_confirm:{task.user_id}"
+        decision_key = f"vk_decision:{task.user_id}"
+        await media_service.pending.set(confirm_key, {"tracks": tracks})
+        await media_service.redis.set(decision_key, "waiting", ex=1800)
+        await _safe_edit(
+            status_msg,
+            get_text(user_lang, "vk_confirm_download", total=total, size=_human_size(int(est_mb * 1024 * 1024)), eta="~" + _human_duration(est_sec)),
+            reply_markup=_keyboard_vk_confirm(user_lang),
+        )
+        while True:
+            await asyncio.sleep(1)
+            decision = await media_service.redis.get(decision_key)
+            if decision == "yes":
+                st = await media_service.pending.pop(confirm_key)
+                tracks = (st or {}).get("tracks", [])
+                total = len(tracks)
+                break
+            if decision == "no":
+                await media_service.pending.pop(confirm_key)
+                await media_service.redis.delete(decision_key)
+                raise DownloadCancelled("cancelled by user")
+            if decision is None:
+                await media_service.pending.pop(confirm_key)
+                raise DownloadCancelled("confirm timeout")
+
     sent = 0
     skipped = 0
     last_update = [0.0]
-    delay = _send_delay(status_msg)
+    started = time.time()
 
     for idx, t in enumerate(tracks, start=1):
         if media_service.queue.is_cancel_requested_sync(task.user_id):
@@ -811,7 +867,7 @@ async def _process_vk_user_stream(task: QueueTask, status_msg: Message | None, u
         artist = t.get("artist") or "Unknown"
         title = t.get("title") or f"Track {idx}"
 
-        await _vk_stream_progress(status_msg, last_update, idx, total, artist, title, user_lang)
+        await _vk_stream_progress(status_msg, last_update, started, idx, total, artist, title, user_lang)
 
         media_key = await media_service.compute_media_key(
             url=None,
@@ -858,7 +914,7 @@ async def _process_vk_user_stream(task: QueueTask, status_msg: Message | None, u
             cleanup(track_tmpdir)
 
     if status_msg:
-        await _safe_edit(status_msg, get_text(user_lang, "vk_download_done", sent=sent, skipped=skipped))
+        await _safe_edit(status_msg, get_text(user_lang, "vk_download_done", sent=sent, skipped=skipped, elapsed="~" + _human_duration(time.time() - started)))
 
 
 async def _run_vk_user_stream(task: QueueTask, status_msg: Message | None, user_lang: str):
@@ -1113,6 +1169,20 @@ async def cb_cancel_download(client: Client, cq: CallbackQuery):
         await _safe_edit(cq.message, get_text(lang, "cancel_downloading"), reply_markup=None)
     else:
         await cq.answer(get_text(lang, "cancel_no_active"), show_alert=True)
+
+
+@app.on_callback_query(filters.regex(r"^vk_confirm_(yes|no)$"))
+async def cb_vk_confirm(client: Client, cq: CallbackQuery):
+    """Handle large VK batch download confirmation."""
+    lang = (await media_service.storage.get_user_language(cq.from_user.id)) or "ru"
+    decision = "yes" if cq.data == "vk_confirm_yes" else "no"
+    decision_key = f"vk_decision:{cq.from_user.id}"
+    if not await media_service.redis.exists(decision_key):
+        await cq.answer(get_text(lang, "vk_confirm_expired"), show_alert=True)
+        return
+    await media_service.redis.set(decision_key, decision, ex=1800)
+    await cq.answer()
+    await _safe_edit(cq.message, get_text(lang, "vk_confirm_waiting" if decision == "yes" else "cancel_done"), reply_markup=None)
 
 
 @app.on_message(filters.command("saves"))
