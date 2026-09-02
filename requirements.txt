@@ -10,3 +10,4 @@ SQLAlchemy
 asyncpg
 redis
 httpx[socks]
+cryptography

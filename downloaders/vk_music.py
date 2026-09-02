@@ -237,6 +237,83 @@ def _probe_duration(path: Path) -> float:
         return 0.0
 
 
+async def _hls_fetch_decrypt(
+    playlist_url: str,
+    out_path: Path,
+    client: httpx.AsyncClient,
+    should_cancel: CancelCheck | None = None,
+) -> None:
+    """Fetch a VK HLS playlist, decrypt AES-128 segments, concat to one MPEG-TS.
+
+    VK alternates #EXT-X-KEY METHOD=AES-128 / METHOD=NONE between segments and
+    rotates the key URI. We track the active key/method per segment (HLS spec:
+    a KEY tag applies to all following segments until the next KEY tag) and
+    decrypt AES-128-CBC with IV = key-uri-implicit media-sequence when no IV
+    is given. Segments and keys are fetched through the same (proxied) client
+    ffmpeg couldn't reach reliably.
+    """
+    from urllib.parse import urljoin
+
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    headers = {"User-Agent": VK_USER_AGENT}
+    resp = await client.get(playlist_url, headers=headers, follow_redirects=True, timeout=30.0)
+    resp.raise_for_status()
+    lines = resp.text.splitlines()
+
+    key_cache: dict[str, bytes] = {}
+    cur_method = "NONE"
+    cur_key: bytes | None = None
+    cur_iv: bytes | None = None
+    media_seq = 0
+    # initial media sequence (for implicit IV)
+    for ln in lines:
+        if ln.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+            media_seq = int(ln.split(":", 1)[1].strip())
+            break
+
+    seg_index = media_seq
+    with open(out_path, "wb") as out:
+        for ln in lines:
+            ln = ln.strip()
+            if ln.startswith("#EXT-X-KEY:"):
+                attrs = ln[len("#EXT-X-KEY:"):]
+                m_method = re.search(r"METHOD=([^,]+)", attrs)
+                cur_method = m_method.group(1) if m_method else "NONE"
+                if cur_method == "AES-128":
+                    m_uri = re.search(r'URI="([^"]+)"', attrs)
+                    key_uri = urljoin(playlist_url, m_uri.group(1)) if m_uri else None
+                    if key_uri not in key_cache:
+                        kr = await client.get(key_uri, headers=headers, follow_redirects=True, timeout=15.0)
+                        kr.raise_for_status()
+                        key_cache[key_uri] = kr.content
+                    cur_key = key_cache[key_uri]
+                    m_iv = re.search(r"IV=0x([0-9A-Fa-f]+)", attrs)
+                    cur_iv = bytes.fromhex(m_iv.group(1)) if m_iv else None
+                else:
+                    cur_key = cur_iv = None
+                continue
+            if not ln or ln.startswith("#"):
+                continue
+            # segment line
+            if should_cancel and should_cancel():
+                raise DownloadCancelled("download cancelled")
+            seg_url = urljoin(playlist_url, ln)
+            sr = await client.get(seg_url, headers=headers, follow_redirects=True, timeout=30.0)
+            sr.raise_for_status()
+            data = sr.content
+            if cur_method == "AES-128" and cur_key:
+                iv = cur_iv if cur_iv is not None else seg_index.to_bytes(16, "big")
+                dec = Cipher(algorithms.AES(cur_key), modes.CBC(iv)).decryptor()
+                data = dec.update(data) + dec.finalize()
+                # strip PKCS7 padding
+                pad = data[-1]
+                if 1 <= pad <= 16 and data[-pad:] == bytes([pad]) * pad:
+                    data = data[:-pad]
+            out.write(data)
+            seg_index += 1
+
+
 async def _download_vk_direct(
     url: str,
     artist: str,
@@ -267,26 +344,26 @@ async def _download_vk_direct(
     afmt = AUDIO_FORMATS.get(audio_format, AUDIO_FORMATS["mp3_192"])
     safe_stem = _safe_filename(f"{artist} - {title}")[:150].strip() or "track"
     final_path = tmpdir / f"{safe_stem}{afmt['ext']}"
+    raw_ts = tmpdir / "stream.ts"
 
     if on_progress:
         await on_progress(f"Downloading '{artist} - {title}' from VK...")
 
-    # ffmpeg reads the m3u8 directly, fetches every .ts segment + AES-128 key
-    # (VK alternates METHOD=AES-128 / METHOD=NONE per segment) and concatenates
-    # them gaplessly. reconnect flags prevent dropped segments -> truncated audio.
-    ffmpeg_cmd = [
-        "ffmpeg", "-y",
-        "-user_agent", VK_USER_AGENT,
-        "-reconnect", "1",
-        "-reconnect_streamed", "1",
-        "-reconnect_on_network_error", "1",
-        "-reconnect_on_http_error", "4xx,5xx",
-        "-reconnect_delay_max", "5",
-        "-rw_timeout", "30000000",
-        "-allowed_extensions", "ALL",
-        "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-        "-i", url,
-    ]
+    client = await get_http_client(enable_proxy=True)
+    try:
+        await _hls_fetch_decrypt(url, raw_ts, client, should_cancel)
+    except DownloadCancelled:
+        raise
+    except Exception as e:  # noqa: BLE001
+        log.warning("VK HLS fetch failed for %s - %s: %s", artist, title, e)
+        return None
+
+    if not raw_ts.exists() or raw_ts.stat().st_size < 1024:
+        return None
+
+    # Re-encode the decrypted MPEG-TS to the target codec. VK's TS has an
+    # irregular packet size, so let ffmpeg resync it into a clean container.
+    ffmpeg_cmd = ["ffmpeg", "-y", "-i", str(raw_ts)]
     if afmt["codec"] == "flac":
         ffmpeg_cmd += ["-c:a", "flac"]
     elif afmt["codec"] == "m4a":
@@ -300,22 +377,20 @@ async def _download_vk_direct(
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
-    while True:
-        if should_cancel and should_cancel():
-            proc.kill()
-            await proc.wait()
-            raise DownloadCancelled("download cancelled")
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=1.0)
-            break
-        except asyncio.TimeoutError:
-            continue
-    stderr = (await proc.stderr.read()) if proc.stderr else b""
+    _, stderr = await proc.communicate()
     if proc.returncode != 0 or not final_path.exists() or final_path.stat().st_size < 1024:
-        log.warning("VK ffmpeg download failed for %s - %s: %s", artist, title, stderr.decode(errors="ignore")[-300:])
+        log.warning("VK ffmpeg re-encode failed for %s - %s: %s", artist, title, stderr.decode(errors="ignore")[-300:])
         return None
 
-    client = await get_http_client(enable_proxy=True)
+    # Guard against truncation: dropped segment/key would shorten the track.
+    if expected_duration and expected_duration > 0:
+        actual = _probe_duration(final_path)
+        if actual > 0 and actual < expected_duration - 8:
+            log.warning(
+                "VK download truncated for %s - %s: got %.0fs, expected %ds",
+                artist, title, actual, expected_duration,
+            )
+            return None
 
     # Embed cover art
     thumb_file = None
