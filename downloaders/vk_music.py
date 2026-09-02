@@ -246,6 +246,7 @@ async def _download_vk_direct(
     tmpdir: Path,
     on_progress: ProgressCallback | None = None,
     should_cancel: CancelCheck | None = None,
+    expected_duration: int | None = None,
 ) -> DownloadResult | None:
     """Download mp3 directly from VK CDN via httpx streaming, bypassing yt-dlp.
 
