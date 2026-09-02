@@ -223,6 +223,20 @@ async def list_vk_user_tracks(owner_id: str, token: str | None = None) -> list[d
     return all_tracks
 
 
+def _probe_duration(path: Path) -> float:
+    """Return media duration in seconds via ffprobe, 0.0 on error."""
+    import subprocess
+    try:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+        return float(out)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 async def _download_vk_direct(
     url: str,
     artist: str,
@@ -256,10 +270,20 @@ async def _download_vk_direct(
     if on_progress:
         await on_progress(f"Downloading '{artist} - {title}' from VK...")
 
-    # ffmpeg reads the m3u8 (or plain mp3) directly and re-encodes to target codec
+    # ffmpeg reads the m3u8 directly, fetches every .ts segment + AES-128 key
+    # (VK alternates METHOD=AES-128 / METHOD=NONE per segment) and concatenates
+    # them gaplessly. reconnect flags prevent dropped segments -> truncated audio.
     ffmpeg_cmd = [
         "ffmpeg", "-y",
         "-user_agent", VK_USER_AGENT,
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_on_network_error", "1",
+        "-reconnect_on_http_error", "4xx,5xx",
+        "-reconnect_delay_max", "5",
+        "-rw_timeout", "30000000",
+        "-allowed_extensions", "ALL",
+        "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
         "-i", url,
     ]
     if afmt["codec"] == "flac":
@@ -338,6 +362,7 @@ async def fetch_vk_track(
             result = await _download_vk_direct(
                 direct_url, artist, title, thumb_url,
                 audio_format, tmpdir, on_progress, should_cancel,
+                expected_duration=duration,
             )
             if result:
                 return result
