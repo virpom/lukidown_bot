@@ -135,8 +135,9 @@ def _base_ydl_opts() -> dict:
         "no_warnings": True,
         "noplaylist": True,
         "socket_timeout": 15,
-        "retries": 3,
-        "fragment_retries": 3,
+        "retries": 5,
+        "fragment_retries": 10,
+        "hls_prefer_native": False,
         "remote_components": ["ejs:github"],
         "http_headers": {
             "User-Agent": (

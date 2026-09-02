@@ -10,12 +10,16 @@ import httpx
 from config import config
 from downloaders.collections import _process_collection_tracks
 from downloaders.core import (
+    AUDIO_FORMATS,
     CancelCheck,
     DownloadCancelled,
     DownloadResult,
     FileTooLarge,
     ProgressCallback,
     _download_track_search,
+    _embed_cover_mp3,
+    _human_size,
+    _safe_filename,
     download_ytdlp,
 )
 from downloaders.http import get_http_client
@@ -219,6 +223,129 @@ async def list_vk_user_tracks(owner_id: str, token: str | None = None) -> list[d
     return all_tracks
 
 
+async def _download_vk_direct(
+    url: str,
+    artist: str,
+    title: str,
+    thumb_url: str | None,
+    audio_format: str,
+    tmpdir: Path,
+    on_progress: ProgressCallback | None = None,
+    should_cancel: CancelCheck | None = None,
+) -> DownloadResult | None:
+    """Download mp3 directly from VK CDN via httpx streaming, bypassing yt-dlp.
+
+    VK serves audio as a single mp3 file (not HLS). When yt-dlp processes
+    this URL it sometimes misidentifies the stream, causing segment-boundary
+    glitches (clicks/silence at ~25-30s). Streaming the raw bytes with httpx
+    avoids this entirely.
+
+    Returns None if the URL turns out to be non-mp3 (e.g. m3u8), so the
+    caller can fall back to yt-dlp or search.
+    """
+    if ".m3u8" in url:
+        # genuine HLS — let yt-dlp handle it
+        return None
+
+    client = await get_http_client(enable_proxy=True)
+    max_bytes = 50 * 1024 * 1024  # 50 MB safety cap
+    afmt = AUDIO_FORMATS.get(audio_format, AUDIO_FORMATS["mp3_192"])
+    ext = ".mp3"  # VK always serves mp3
+    safe_stem = _safe_filename(f"{artist} - {title}")[:150].strip() or "track"
+    out_path = tmpdir / f"{safe_stem}{ext}"
+
+    if on_progress:
+        await on_progress(f"Downloading '{artist} - {title}' from VK...")
+
+    try:
+        async with client.stream(
+            "GET", url,
+            headers={"User-Agent": VK_USER_AGENT},
+            timeout=httpx.Timeout(60.0, connect=10.0),
+            follow_redirects=True,
+        ) as resp:
+            if resp.status_code != 200:
+                log.warning("VK CDN returned %s for %s - %s", resp.status_code, artist, title)
+                return None
+
+            ct = resp.headers.get("content-type", "")
+            if "mpegurl" in ct or "m3u8" in ct:
+                return None  # HLS playlist, fall back
+
+            total = int(resp.headers.get("content-length", 0) or 0)
+            if total and total > max_bytes:
+                raise FileTooLarge(f"file too large: ~{_human_size(total)}")
+
+            downloaded = 0
+            with open(out_path, "wb") as f:
+                async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
+                    if should_cancel and should_cancel():
+                        raise DownloadCancelled("download cancelled")
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if downloaded > max_bytes:
+                        raise FileTooLarge(f"file too large: >{_human_size(max_bytes)}")
+    except (DownloadCancelled, FileTooLarge):
+        raise
+    except httpx.HTTPError as e:
+        log.warning("httpx stream failed for %s - %s: %s", artist, title, e)
+        return None
+
+    if not out_path.exists() or out_path.stat().st_size < 1024:
+        return None  # too small, probably an error page
+
+    # Transcode to target format if needed (VK always gives mp3)
+    need_transcode = afmt["codec"] not in ("mp3",)
+    final_path = out_path
+    if need_transcode:
+        import asyncio
+        target_ext = afmt["ext"]
+        transcoded = tmpdir / f"{safe_stem}{target_ext}"
+        ffmpeg_cmd = ["ffmpeg", "-y", "-i", str(out_path)]
+        if afmt["codec"] == "flac":
+            ffmpeg_cmd += ["-c:a", "flac"]
+        elif afmt["codec"] == "m4a":
+            ffmpeg_cmd += ["-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart"]
+        else:
+            ffmpeg_cmd += ["-c:a", "libmp3lame", "-b:a", f"{afmt['quality']}k"]
+        ffmpeg_cmd.append(str(transcoded))
+        proc = await asyncio.create_subprocess_exec(
+            *ffmpeg_cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode == 0 and transcoded.exists() and transcoded.stat().st_size > 0:
+            final_path = transcoded
+        else:
+            log.warning("ffmpeg transcode failed: %s", stderr.decode(errors="ignore")[-300:])
+            final_path = out_path  # keep original mp3
+
+    # Embed cover art
+    thumb_file = None
+    if thumb_url:
+        try:
+            thumb_path = tmpdir / "thumbnail.jpg"
+            resp_thumb = await client.get(thumb_url, timeout=15.0, follow_redirects=True)
+            if resp_thumb.status_code == 200:
+                thumb_path.write_bytes(resp_thumb.content)
+                thumb_file = thumb_path
+                if final_path.suffix.lower() == ".mp3":
+                    _embed_cover_mp3(final_path, thumb_file)
+        except Exception:  # noqa: BLE001
+            log.debug("thumb download failed", exc_info=True)
+
+    return DownloadResult(
+        filepath=final_path,
+        title=title,
+        thumbnail=thumb_file,
+        uploader=artist,
+        is_audio=True,
+        duration=0,
+        filesize=final_path.stat().st_size,
+    )
+
+
 async def fetch_vk_track(
     track: dict,
     audio_format: str,
@@ -235,17 +362,14 @@ async def fetch_vk_track(
     direct_url = track.get("url")
     if direct_url:
         try:
-            return await download_ytdlp(
-                direct_url,
-                want_audio=True,
-                tmpdir=tmpdir,
-                on_progress=on_progress,
-                audio_format=audio_format,
-                music_title=title,
-                music_artist=artist,
-                thumb_url=thumb_url,
-                should_cancel=should_cancel,
+            # ponytail: download raw mp3 from VK CDN via httpx, bypass yt-dlp
+            # to avoid HLS segment boundary glitches (clicks/pauses at ~26s)
+            result = await _download_vk_direct(
+                direct_url, artist, title, thumb_url,
+                audio_format, tmpdir, on_progress, should_cancel,
             )
+            if result:
+                return result
         except (DownloadCancelled, FileTooLarge):
             raise
         except Exception as e:  # noqa: BLE001
@@ -294,19 +418,10 @@ async def download_vk_music(
         if not tracks:
             raise RuntimeError("VK API returned no track info")
         track = tracks[0]
-        artist = track.get("artist", "")
-        title = track.get("title", "")
-        thumb_url = (track.get("thumb") or {}).get("photo_600") or \
-                    (track.get("album", {}).get("thumb") or {}).get("photo_600")
-        if on_progress:
-            await on_progress(f"Searching '{artist} - {title}' on YouTube Music...")
-        return await _download_track_search(
-            artist, title, tmpdir,
-            on_progress=on_progress,
-            audio_format=audio_format,
-            thumb_url=thumb_url or None,
+        return await fetch_vk_track(
+            track, audio_format, tmpdir,
             should_cancel=should_cancel,
-            expected_duration=track.get("duration"),
+            on_progress=on_progress,
         )
     owner_id = params["owner_id"]
     playlist_id = params["playlist_id"]
