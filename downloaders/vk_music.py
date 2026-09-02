@@ -240,86 +240,57 @@ async def _download_vk_direct(
     glitches (clicks/silence at ~25-30s). Streaming the raw bytes with httpx
     avoids this entirely.
 
-    Returns None if the URL turns out to be non-mp3 (e.g. m3u8), so the
-    caller can fall back to yt-dlp or search.
-    """
-    if ".m3u8" in url:
-        # genuine HLS — let yt-dlp handle it
-        return None
+    VK now serves audio as HLS (.m3u8 with .ts segments). ffmpeg fetches
+    the playlist and concatenates all segments into one gapless file —
+    unlike yt-dlp's fragment handling which glitches at segment boundaries
+    (clicks/silence at ~26s).
 
-    client = await get_http_client(enable_proxy=True)
-    max_bytes = 50 * 1024 * 1024  # 50 MB safety cap
+    Returns None on failure so the caller can fall back to YouTube search.
+    """
+    import asyncio
+
     afmt = AUDIO_FORMATS.get(audio_format, AUDIO_FORMATS["mp3_192"])
-    ext = ".mp3"  # VK always serves mp3
     safe_stem = _safe_filename(f"{artist} - {title}")[:150].strip() or "track"
-    out_path = tmpdir / f"{safe_stem}{ext}"
+    final_path = tmpdir / f"{safe_stem}{afmt['ext']}"
 
     if on_progress:
         await on_progress(f"Downloading '{artist} - {title}' from VK...")
 
-    try:
-        async with client.stream(
-            "GET", url,
-            headers={"User-Agent": VK_USER_AGENT},
-            timeout=httpx.Timeout(60.0, connect=10.0),
-            follow_redirects=True,
-        ) as resp:
-            if resp.status_code != 200:
-                log.warning("VK CDN returned %s for %s - %s", resp.status_code, artist, title)
-                return None
+    # ffmpeg reads the m3u8 (or plain mp3) directly and re-encodes to target codec
+    ffmpeg_cmd = [
+        "ffmpeg", "-y",
+        "-user_agent", VK_USER_AGENT,
+        "-i", url,
+    ]
+    if afmt["codec"] == "flac":
+        ffmpeg_cmd += ["-c:a", "flac"]
+    elif afmt["codec"] == "m4a":
+        ffmpeg_cmd += ["-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart"]
+    else:
+        ffmpeg_cmd += ["-c:a", "libmp3lame", "-b:a", f"{afmt['quality']}k"]
+    ffmpeg_cmd.append(str(final_path))
 
-            ct = resp.headers.get("content-type", "")
-            if "mpegurl" in ct or "m3u8" in ct:
-                return None  # HLS playlist, fall back
-
-            total = int(resp.headers.get("content-length", 0) or 0)
-            if total and total > max_bytes:
-                raise FileTooLarge(f"file too large: ~{_human_size(total)}")
-
-            downloaded = 0
-            with open(out_path, "wb") as f:
-                async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
-                    if should_cancel and should_cancel():
-                        raise DownloadCancelled("download cancelled")
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if downloaded > max_bytes:
-                        raise FileTooLarge(f"file too large: >{_human_size(max_bytes)}")
-    except (DownloadCancelled, FileTooLarge):
-        raise
-    except httpx.HTTPError as e:
-        log.warning("httpx stream failed for %s - %s: %s", artist, title, e)
+    proc = await asyncio.create_subprocess_exec(
+        *ffmpeg_cmd,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    while True:
+        if should_cancel and should_cancel():
+            proc.kill()
+            await proc.wait()
+            raise DownloadCancelled("download cancelled")
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=1.0)
+            break
+        except asyncio.TimeoutError:
+            continue
+    stderr = (await proc.stderr.read()) if proc.stderr else b""
+    if proc.returncode != 0 or not final_path.exists() or final_path.stat().st_size < 1024:
+        log.warning("VK ffmpeg download failed for %s - %s: %s", artist, title, stderr.decode(errors="ignore")[-300:])
         return None
 
-    if not out_path.exists() or out_path.stat().st_size < 1024:
-        return None  # too small, probably an error page
-
-    # Transcode to target format if needed (VK always gives mp3)
-    need_transcode = afmt["codec"] not in ("mp3",)
-    final_path = out_path
-    if need_transcode:
-        import asyncio
-        target_ext = afmt["ext"]
-        transcoded = tmpdir / f"{safe_stem}{target_ext}"
-        ffmpeg_cmd = ["ffmpeg", "-y", "-i", str(out_path)]
-        if afmt["codec"] == "flac":
-            ffmpeg_cmd += ["-c:a", "flac"]
-        elif afmt["codec"] == "m4a":
-            ffmpeg_cmd += ["-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart"]
-        else:
-            ffmpeg_cmd += ["-c:a", "libmp3lame", "-b:a", f"{afmt['quality']}k"]
-        ffmpeg_cmd.append(str(transcoded))
-        proc = await asyncio.create_subprocess_exec(
-            *ffmpeg_cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode == 0 and transcoded.exists() and transcoded.stat().st_size > 0:
-            final_path = transcoded
-        else:
-            log.warning("ffmpeg transcode failed: %s", stderr.decode(errors="ignore")[-300:])
-            final_path = out_path  # keep original mp3
+    client = await get_http_client(enable_proxy=True)
 
     # Embed cover art
     thumb_file = None
