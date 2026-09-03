@@ -936,6 +936,7 @@ async def _run_vk_user_stream(task: QueueTask, status_msg: Message | None, user_
 
 async def _process_queued_download(task: QueueTask):
     """Execute queued download task and handle file sending or error reporting."""
+    await media_service.queue.clear_cancel(task.user_id)
     await media_service.queue.set_active(task.user_id, task.status_message_id)
     status_msg = await app.get_messages(task.status_chat_id, task.status_message_id)
     user_lang = (await media_service.storage.get_user_language(task.user_id)) or "ru"
