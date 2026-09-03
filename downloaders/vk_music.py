@@ -366,10 +366,10 @@ async def _download_vk_direct(
 
     concat_file = tmpdir / "segments.ffconcat"
     concat_file.write_text(
-        "ffconcat version 1.0\n" + "".join(f"file '{path}'\n" for path in segment_paths)
+        "ffconcat version 1.0\n" + "".join(f"file '{path.resolve()}'\n" for path in segment_paths)
     )
     # Open each TS segment separately so ffmpeg resets its demuxer at HLS boundaries.
-    ffmpeg_cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file)]
+    ffmpeg_cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file.resolve())]
     if afmt["codec"] == "flac":
         ffmpeg_cmd += ["-c:a", "flac"]
     elif afmt["codec"] == "m4a":
