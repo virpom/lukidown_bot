@@ -242,8 +242,8 @@ async def _hls_fetch_decrypt(
     out_path: Path,
     client: httpx.AsyncClient,
     should_cancel: CancelCheck | None = None,
-) -> None:
-    """Fetch a VK HLS playlist, decrypt AES-128 segments, concat to one MPEG-TS.
+) -> list[Path]:
+    """Fetch a VK HLS playlist and decrypt AES-128 segments.
 
     VK alternates #EXT-X-KEY METHOD=AES-128 / METHOD=NONE between segments and
     rotates the key URI. We track the active key/method per segment (HLS spec:
@@ -273,8 +273,8 @@ async def _hls_fetch_decrypt(
             break
 
     seg_index = media_seq
-    with open(out_path, "wb") as out:
-        for ln in lines:
+    segment_paths: list[Path] = []
+    for ln in lines:
             ln = ln.strip()
             if ln.startswith("#EXT-X-KEY:"):
                 attrs = ln[len("#EXT-X-KEY:"):]
@@ -310,8 +310,11 @@ async def _hls_fetch_decrypt(
                 pad = data[-1]
                 if 1 <= pad <= 16 and data[-pad:] == bytes([pad]) * pad:
                     data = data[:-pad]
-            out.write(data)
+            segment_path = out_path.with_name(f"{out_path.stem}-{seg_index:05d}.ts")
+            segment_path.write_bytes(data)
+            segment_paths.append(segment_path)
             seg_index += 1
+    return segment_paths
 
 
 async def _download_vk_direct(
@@ -351,19 +354,22 @@ async def _download_vk_direct(
 
     client = await get_http_client(enable_proxy=True)
     try:
-        await _hls_fetch_decrypt(url, raw_ts, client, should_cancel)
+        segment_paths = await _hls_fetch_decrypt(url, raw_ts, client, should_cancel)
     except DownloadCancelled:
         raise
     except Exception as e:  # noqa: BLE001
         log.warning("VK HLS fetch failed for %s - %s: %s", artist, title, e)
         return None
 
-    if not raw_ts.exists() or raw_ts.stat().st_size < 1024:
+    if not segment_paths or sum(path.stat().st_size for path in segment_paths) < 1024:
         return None
 
-    # Re-encode the decrypted MPEG-TS to the target codec. VK's TS has an
-    # irregular packet size, so let ffmpeg resync it into a clean container.
-    ffmpeg_cmd = ["ffmpeg", "-y", "-i", str(raw_ts)]
+    concat_file = tmpdir / "segments.ffconcat"
+    concat_file.write_text(
+        "ffconcat version 1.0\n" + "".join(f"file '{path}'\n" for path in segment_paths)
+    )
+    # Open each TS segment separately so ffmpeg resets its demuxer at HLS boundaries.
+    ffmpeg_cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file)]
     if afmt["codec"] == "flac":
         ffmpeg_cmd += ["-c:a", "flac"]
     elif afmt["codec"] == "m4a":
@@ -532,4 +538,3 @@ async def download_vk_music(
         download_one=_vk_download_one,
         uploader=album_artist_final,
     )
-
